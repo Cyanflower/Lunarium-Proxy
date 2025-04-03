@@ -1,250 +1,399 @@
-# 开发者 A 专注于核心业务逻辑和状态维护，开发者 B 专注于对外接口和基础设施。在单元 A1 和 B1/B2 完成后，就可以开始初步集成 `AppState` 和认证。在 A2/A3 和 B3 完成后，就可以进行端到端的代理功能测试。A4 和 B4/B5 可以在主体功能完成后继续完善。
+## Gemini 反向代理开发计划
 
-## 协作模式与集成点
+**开发者职责:**
 
-1.  **接口优先**: 双方需要首先就 `AppState` 的结构、`manager` 模块提供的函数签名（例如 `add_key`, `select_key`, `add_cookie`, `select_cookie`, `update_status` 等）以及 `proxy::core::process_request` 的函数签名和返回值（尤其是如何传递流式响应）达成一致。
-2.  **共享状态**: `AppState` 是核心共享数据。开发者 A 负责其内部逻辑和维护，开发者 B 通过 Axum 的 `State` 或 `Extension` 访问它。使用 `Arc<RwLock<AppState>>` 确保线程安全。
-3.  **配置驱动**: `config.rs` 定义的配置结构由开发者 B 主要负责，但需要开发者 A 确认其中包含初始化状态所需的所有字段（如初始密钥列表、Cookie 列表等）。
-4.  **Mocking/存根**: 在集成之前，开发者 B 可以暂时 Mock 开发者 A 的 `proxy::core::process_request` 调用（例如，只返回一个固定的成功或失败响应），而开发者 A 可以编写单元测试或简单的二进制程序来调用其 `manager` 和 `proxy` 模块的功能，而无需完整的 Web 服务器。
-5.  **定期同步**: 建议每天进行简短同步，讨论进度、遇到的问题和接口调整。
-6.  **集成测试**: 在各自单元基本完成后，进行集成测试，重点验证 API 调用能否正确触发核心代理逻辑、状态能否正确更新、流式响应是否正常。
+*   **Developer A:** 专注于核心业务逻辑、状态管理、异步任务协调（`KeyManager`, `Dispatcher`, `Handlers`, `models.rs`, `prompt.rs`）。
+*   **Developer B:** 专注于对外接口、基础设施、配置、构建、部署、服务器设置（`main.rs`, `cli.rs`, `config.rs`, `state.rs`, `error.rs`, `logger.rs`, `tls.rs`, `proxy.rs`, `router.rs`, 管理 API）。
 
 ---
 
-## 开发者 A: 核心代理逻辑与状态管理
+### 阶段一：项目基础架构与信息调查 (Foundation & Investigation)
 
-**主要职责**: 实现代理的核心功能，包括与外部 Gemini/AI Studio 的交互、密钥/Cookie 的选择与状态管理、以及后台任务。
+**目标:** 搭建项目骨架，定义核心数据结构，配置加载，并建立最基础的 Web 服务。
 
-### 单元 A1: 状态管理基础 (State & Managers)
+**单元 1.1: 核心数据结构定义 (`models.rs`)**
 
-*   **开发目标**:
-    *   定义应用程序的核心运行时状态结构 `AppState` (`src/state.rs`)。
-    *   实现 Gemini API 密钥的管理逻辑 (`src/manager/keys.rs`)，包括数据结构、增删查改、状态更新、选择逻辑（初始可选简单轮询）。
-    *   实现 AI Studio Cookie 的管理逻辑 (`src/manager/cookies.rs`)，类似密钥管理。
-    *   确保状态管理是线程安全的（使用 `Arc<RwLock<...>>`）。
-*   **实现流程**:
-    1.  在 `src/state.rs` 中定义 `AppState` 结构体，包含 `Vec` 或 `HashMap` 来存储 `ApiKey` 和 `AiStudioCookie` 实例（这些实例也需要定义结构），以及可能的全局配置。用 `RwLock` 包裹需要修改的数据。
-    2.  在 `src/manager/keys.rs` 中定义 `ApiKey` 结构（包含 key 值, 状态, 使用次数, token 消耗, 最后使用时间等）。实现 `KeyManager`（或直接在 `AppState` 上实现方法）提供 `add_key`, `get_key`, `update_key_usage`, `select_available_key` 等函数。
-    3.  在 `src/manager/cookies.rs` 中定义 `AiStudioCookie` 结构（类似 `ApiKey`）。实现 `CookieManager`（或 `AppState` 上的方法）提供类似 `keys.rs` 的管理功能。
-    4.  所有修改状态的操作都需要获取 `AppState` 的写锁 (`write()`)，只读操作获取读锁 (`read()`)。
-*   **测试方案**:
-    *   **内容**: 测试状态结构的初始化、密钥/Cookie 的添加、查找、更新（次数、状态）、删除（如果需要）、以及选择逻辑是否按预期工作（例如，能否选出未达限制且状态正常的 Key/Cookie）。测试并发访问下的安全性（基础测试，非压力测试）。
-    *   **工具**: 使用 Rust 的内置单元测试 (`#[cfg(test)]`, `#[test]`)。可以直接创建 `AppState` 实例进行测试。对于并发，可以 `std::thread::spawn` 或 `tokio::spawn` 几个任务同时读写状态，检查结果是否一致（注意测试中的竞争条件）。
+*   **开发者:** A
+*   **实现目标:** 定义项目核心的共享数据结构和枚举。
+*   **流程:**
+    1.  在 `models.rs` 中定义:
+        *   `KeyType` enum (`Gemini`, `AIStudio`).
+        *   `Key` enum (包含 `GeminiApiKeyInfo` struct, `AIStudioCookieInfo` struct)。考虑包含Key的ID、值、状态等。
+        *   `KeyStatus` enum (`Available`, `InUse`, `Exhausted`, `Invalid`, `Disabled`).
+        *   `Reason` enum (用于 `KeyManager` 回收 Key 时说明原因，如 `Success`, `RateLimited`, `AuthError`, `NetworkError`, `Unknown`).
+        *   `DispatchRequest` struct (包含 `path: String`, `query: QueryParamsMap`, `body: serde_json::Value`, `target_key: Key`, `response_sender: oneshot::Sender<HandlerResponse>`, `key_return_tx: mpsc::Sender<(Key, Option<Reason>)>`). (注意 `QueryParamsMap` 可以是 `HashMap<String, String>` 或类似类型)。
+        *   `HandlerResponse` type alias: `Result<reqwest::Response, HandlerError>`.
+*   **如何测试:**
+    *   `cargo check`: 确保类型定义编译无误。
+    *   Code Review: 检查数据结构是否清晰、完整，符合设计要求。
 
-### 单元 A2: Gemini API 模式实现
+**单元 1.2: 配置加载与命令行参数 (`config.rs`, `cli.rs`, `main.rs`)**
 
-*   **开发目标**:
-    *   实现与 Google Gemini API 的交互逻辑 (`src/proxy/gemini.rs`)。
-    *   根据 `AppState` 中的可用密钥进行选择。
-    *   构建发送给 Gemini API 的 HTTP 请求（包括认证头）。
-    *   处理来自 Gemini API 的响应（包括普通和流式）。
-    *   更新密钥的使用计数和状态。
-*   **实现流程**:
-    1.  创建一个函数，如 `forward_to_gemini(app_state: Arc<RwLock<AppState>>, request_body: serde_json::Value) -> Result<impl Stream<Item = Result<Bytes, reqwest::Error>>, ProxyError>` (返回值类型需仔细设计以支持流)。
-    2.  在该函数内部，调用 `manager::keys::select_available_key` 从 `AppState` 获取一个可用密钥。
-    3.  使用 `reqwest::Client` 构建请求，设置正确的 URL、HTTP 方法、`Authorization` Header (Bearer token) 和请求体。
-    4.  发送请求。如果是流式请求，获取响应的 `bytes_stream()`。
-    5.  处理响应：检查状态码。如果成功，返回响应流。如果失败（如 429 Too Many Requests, 401 Unauthorized），调用 `manager::keys::update_key_status` 更新 `AppState` 中对应密钥的状态（需要写锁）。
-    6.  返回结果（成功时是流，失败时是错误）。
-*   **测试方案**:
-    *   **内容**: 测试请求构建是否正确（URL, Header, Body）。测试能否正确处理成功的响应（普通和流式）。测试能否在收到特定错误码（如 429）时正确调用状态更新函数。
-    *   **工具**:
-        *   单元测试 (`#[test]`)：可以 Mock `reqwest::Client` (例如使用 `httpmock` 或 `wiremock-rs` 库) 来模拟 Gemini API 的响应，验证函数行为。
-        *   集成测试（可选，谨慎使用）：配置一个真实的（测试用）Gemini Key，实际调用 API，验证交互。可能需要设置环境变量或特定配置文件来启用。`assert!` 检查返回流的内容片段。
+*   **开发者:** B
+*   **实现目标:** 实现配置文件的加载（使用 `serde`）和命令行参数的解析（使用 `clap`）。
+*   **流程:**
+    1.  在 `config.rs` 中:
+        *   定义 `Config` struct，使用 `serde::Deserialize`。包含字段如 `gemini_base_url`, `aistudio_base_url`, `management_key`, `listen_address`, `tls` (可选配置), `keys` (`Vec<KeyConfig>`) 等。
+        *   定义 `KeyConfig` struct/enum 用于表示配置文件中的 Key/Cookie。
+        *   实现加载 `config.toml` 的函数 `load_config(path: &Path) -> Result<Config, Error>`。
+    2.  在 `cli.rs` 中:
+        *   使用 `clap` 定义命令行参数结构，至少包含 `--config` 选项指定配置文件路径。
+    3.  在 `main.rs` 中:
+        *   解析命令行参数。
+        *   调用 `load_config` 加载配置。
+        *   将加载的 `Config` 存储起来（例如，放入 `Arc` 以便共享）。
+*   **如何测试:**
+    *   创建 `config.toml.example` 和一个测试用的 `config.toml`。
+    *   运行 `cargo run -- --help` 检查 Clap 输出。
+    *   运行 `cargo run -- --config test_config.toml`，在 `main.rs` 中打印加载的配置，验证其正确性。
+    *   测试配置文件不存在或格式错误时的错误处理。
 
-### 单元 A3: AI Studio Cookie 模式实现
+**单元 1.3: 日志与错误处理 (`logger.rs`, `error.rs`)**
 
-*   **开发目标**:
-    *   实现模拟浏览器访问 AI Studio 后端接口的逻辑 (`src/proxy/aistudio.rs`)。
-    *   根据 `AppState` 中的可用 Cookie 进行选择。
-    *   构建伪装的 HTTP 请求（正确的 Headers: User-Agent, Cookie, Referer, Origin 等）。
-    *   处理来自 AI Studio 后端的响应（主要是流式响应）。
-    *   更新 Cookie 的使用计数和状态。
-*   **实现流程**:
-    1.  创建类似 `forward_to_aistudio(app_state: Arc<RwLock<AppState>>, request_body: serde_json::Value) -> Result<impl Stream<Item = Result<Bytes, reqwest::Error>>, ProxyError>` 的函数。
-    2.  调用 `manager::cookies::select_available_cookie` 获取 Cookie。
-    3.  使用 `reqwest::Client` 构建请求。**关键**: 使用浏览器开发者工具分析 AI Studio 网页交互，复制必要的 Headers（特别是 `User-Agent`, `Cookie`, `Origin`, `Referer`, 以及可能的 `X-Goog-*` Headers）。设置正确的 URL 和请求体（可能需要根据前端请求调整）。
-    4.  发送请求并处理响应流，逻辑类似 Gemini 模式，但错误处理可能需要针对 AI Studio 返回的特定错误进行调整（例如 Cookie 失效）。
-    5.  失败时调用 `manager::cookies::update_cookie_status` 更新状态。
-    6.  返回结果。
-*   **测试方案**:
-    *   **内容**: 测试请求构建是否包含所有必要的伪装 Headers。测试能否处理成功的流式响应。测试 Cookie 失效等错误场景下是否能正确更新 Cookie 状态。
-    *   **工具**:
-        *   单元测试 (`#[test]`)：使用 `httpmock` 或 `wiremock-rs` 模拟 AI Studio 后端响应。验证发送的请求头是否符合预期。
-        *   集成测试（困难且不稳定）：需要有效 Cookie，且 AI Studio 后端接口可能变化。如果进行，重点是验证能否成功建立连接并接收到数据流。用 `assert!` 检查流内容。
+*   **开发者:** B
+*   **实现目标:** 初始化 `tracing` 日志系统，定义统一的自定义错误类型。
+*   **流程:**
+    1.  在 `logger.rs` 中:
+        *   实现 `init_logger()` 函数，配置 `tracing_subscriber`（例如，设置日志级别、输出格式、可选的文件输出）。
+    2.  在 `error.rs` 中:
+        *   使用 `thiserror` 定义主要的 `AppError` enum，涵盖配置加载错误、I/O 错误、网络错误、内部通道错误等。
+        *   定义 `HandlerError` enum，用于 `Handlers` 返回给 `proxy.rs` 的特定错误（如 `RequestFailed`, `PromptProcessingFailed`, `BackendAuthError`, `BackendRateLimited`).
+    3.  在 `main.rs` 中调用 `init_logger()`。
+*   **如何测试:**
+    *   在 `main.rs` 和其他模块中添加一些 `tracing::info!`, `tracing::warn!`, `tracing::error!` 日志。
+    *   运行程序，检查控制台输出是否符合预期格式和级别。
+    *   尝试触发配置加载错误，检查错误类型和日志。
 
-### 单元 A4: 核心代理决策与后台任务
+**单元 1.4: 基础 Web 服务与路由 (`main.rs`, `router.rs`, `state.rs`, `tls.rs`)**
 
-*   **开发目标**:
-    *   实现核心请求处理逻辑 (`src/proxy/core.rs`)，根据配置决定调用 Gemini 还是 AI Studio 模式。
-    *   实现后台调度器 (`src/manager/scheduler.rs`)，用于每日重置密钥/Cookie 计数和状态检查。
-*   **实现流程**:
-    1.  **`proxy/core.rs`**: 创建 `process_request(app_state: Arc<RwLock<AppState>>, custom_api_key: String, request_data: RequestData) -> Result<impl Stream<Item = Result<Bytes, reqwest::Error>>, ProxyError>` 函数。
-        *   读取 `AppState` 中的配置，判断当前应使用哪个模式。
-        *   调用 A2 或 A3 中实现的相应转发函数 (`forward_to_gemini` 或 `forward_to_aistudio`)。
-        *   处理可选的提示词预处理逻辑 (`src/proxy/prompt.rs`)（可以先留空或简单实现）。
-        *   返回转发函数的结果。
-    2.  **`manager/scheduler.rs`**: 创建 `run_scheduler(app_state: Arc<RwLock<AppState>>)` 异步函数。
-        *   使用 `tokio::time::interval` 创建一个定时器（例如，每小时检查一次，或者更精确地计算到下一个太平洋时间午夜）。
-        *   在循环中，当到达每日重置时间（例如，检查当前时间是否为太平洋时间午夜），获取 `AppState` 写锁，遍历所有 Keys 和 Cookies，调用 `manager` 中的函数重置它们的计数。
-        *   可以添加定期检查 Key/Cookie 可用性的逻辑（例如，发送一个简单请求测试）。
-        *   在 `main.rs` 中使用 `tokio::spawn` 启动这个任务。
-*   **测试方案**:
-    *   **内容**: 测试 `process_request` 能否根据模拟的配置正确路由到 Gemini 或 AI Studio 的（Mocked）实现。测试调度器能否在预定时间触发重置逻辑（可能需要 Mock 时间或在测试中快速推进时间）。测试状态检查逻辑（如果实现）。
-    *   **工具**:
-        *   单元测试 (`#[test]`)：Mock `AppState` 和 A2/A3 的转发函数，验证 `process_request` 的路由逻辑。对于调度器，可以测试其内部的重置函数，或者使用 `tokio::time::pause()` 和 `advance()` (如果使用 Tokio 的测试工具) 来控制时间。
-        *   集成测试：启动应用，等待调度器运行，通过 API（由开发者 B 实现）检查 Key/Cookie 计数是否被重置。
+*   **开发者:** B
+*   **实现目标:** 启动一个基本的 Axum Web 服务器，定义应用状态 `AppState`，并设置基础路由和可选的 TLS。
+*   **流程:**
+    1.  在 `state.rs` 中:
+        *   定义 `AppState` struct，包含共享状态，如 `config: Arc<Config>`，以及后续会添加的通道发送端 `*_tx`。
+        *   实现 `AppState::new(...)`。
+    2.  在 `tls.rs` 中 (可选):
+        *   实现加载证书和私钥并配置 `rustls` 的辅助函数，返回 `axum_server::tls_rustls::RustlsConfig`。
+    3.  在 `router.rs` 中:
+        *   创建 `create_router(app_state: AppState) -> Router` 函数。
+        *   添加一个简单的根路由 `/` 返回 "OK" (`axum::routing::get("/", || async { "OK" })`)。
+        *   (占位) 添加代理路径前缀 `/api/v1beta/*` 的占位路由。
+    4.  在 `main.rs` 中:
+        *   创建 `AppState` 实例。
+        *   调用 `create_router` 构建 Axum Router。
+        *   根据配置决定是启动 HTTP 还是 HTTPS 服务器 (`axum::Server` 或 `axum_server::bind_rustls`)。
+        *   启动服务器并 `await` 它。
+*   **如何测试:**
+    *   `cargo run`: 启动服务器。
+    *   使用 `curl http://<listen_address>/` (或 `curl -k https://...` 如果启用了自签名 TLS)，应返回 "OK"。
+    *   检查日志确认服务器已启动。
 
 ---
 
-## 开发者 B: Web 服务与 API 接口
+### 阶段二：核心异步逻辑实现 (Core Async Logic)
 
-**主要职责**: 构建 Web 服务器，处理 HTTP 请求，实现 API 路由、认证、静态文件服务、TLS 配置，并与开发者 A 的核心逻辑进行集成。
+**目标:** 实现 `KeyManager` 和 `Dispatcher` 的核心功能，以及 Handler 的基本框架。
 
-### 单元 B1: 基础 Web 服务与配置加载
+**单元 2.1: `KeyManager` - 状态与基础循环**
 
-*   **开发目标**:
-    *   建立基本的 Axum Web 服务器 (`src/main.rs`)。
-    *   实现配置文件的加载 (`src/config.rs`) 和解析 (`toml`)。
-    *   设置基本的日志系统 (`src/logger.rs`)。
-    *   定义命令行参数 (`src/cli.rs`) 用于指定配置路径、端口等。
-*   **实现流程**:
-    1.  **`Cargo.toml`**: 确认 `axum`, `tokio`, `serde`, `serde_json`, `toml`, `tracing`, `tracing-subscriber`, `clap` 等依赖已添加。
-    2.  **`src/cli.rs`**: 使用 `clap` 定义命令行参数结构，如 `--config <PATH>`, `--port <PORT>`。
-    3.  **`src/config.rs`**: 定义 `Config` 结构体，使用 `serde::Deserialize` 派生。包含字段如 `server_port`, `initial_admin_key` (用于首次启动), `gemini_keys` (初始列表), `aistudio_cookies` (初始列表), `log_level`, `tls_cert_path`, `tls_key_path` 等。实现加载 `config.toml` 文件并解析到 `Config` 实例的函数。如果配置文件不存在或特定字段缺失，提供默认值或报错。
-    4.  **`src/logger.rs`**: 初始化 `tracing_subscriber`，根据配置设置日志级别，配置日志输出到控制台。暂时不处理文件日志。
-    5.  **`src/main.rs`**:
-        *   `#[tokio::main]` 函数。
-        *   解析命令行参数 (`cli.rs`)。
-        *   调用 `logger::init()`。
-        *   加载配置 (`config.rs`)。
-        *   创建基础的 `axum::Router`，添加一个简单的根路径 `/` 处理器，返回 "Hello, World!"。
-        *   绑定到配置的端口，启动服务器。
-*   **测试方案**:
-    *   **内容**: 测试命令行参数能否正确解析。测试配置文件（包括示例文件 `config.toml.example`）能否被正确加载和解析。测试不同日志级别配置是否生效。服务器能否在指定端口启动并响应根路径请求。
-    *   **工具**:
-        *   运行 `cargo run -- --help` 检查 CLI。
-        *   运行 `cargo run -- --config config.toml.example` 启动服务器。
-        *   使用 `curl http://localhost:3200` (或其他配置的端口) 检查响应。
-        *   查看控制台输出的日志。
-        *   单元测试 (`#[test]`) 测试 `config.rs` 的加载和解析逻辑，特别是处理缺失文件或字段的情况。
+*   **开发者:** A
+*   **实现目标:** 实现 `KeyManager` 的基本结构、状态存储、以及处理凭证请求和回收的异步循环框架。
+*   **流程:**
+    1.  在 `key_manager.rs` 中:
+        *   定义 `KeyManager` struct，包含凭证存储（例如 `HashMap<KeyId, (Key, KeyStatus)>` 或按类型分开存储）、接收凭证请求的 `mpsc::Receiver<(KeyType, oneshot::Sender<Result<Key, AppError>>)>`、接收凭证回收的 `mpsc::Receiver<(Key, Option<Reason>)>`。
+        *   实现 `KeyManager::new(config: Arc<Config>, key_request_rx, key_return_rx)`，从配置初始化凭证池。
+        *   实现 `async fn run(mut self)` 作为主循环。
+        *   在 `run` 中使用 `tokio::select!` 同时监听 `key_request_rx` 和 `key_return_rx`。
+        *   实现 `handle_key_request(&mut self, key_type: KeyType, response_tx: oneshot::Sender<...>)`: 查找可用 Key，标记为 `InUse`，通过 `response_tx` 发回。如果无可用 Key，则发送错误或放入等待队列（初期可以先返回错误）。
+        *   实现 `handle_key_return(&mut self, key: Key, reason: Option<Reason>)`: 根据 `reason` 更新 Key 的状态（`Available`, `Exhausted`, `Invalid` 等）。
+*   **如何测试:**
+    *   **单元测试:**
+        *   创建 `KeyManager` 实例（使用模拟配置和通道）。
+        *   发送请求消息，检查是否能通过 `oneshot` 接收到预期的 Key，并检查内部状态是否变为 `InUse`。
+        *   发送回收消息，检查内部状态是否按预期更新 (e.g., `Available`, `Exhausted`)。
+        *   测试无可用 Key 时的情况。
+    *   **集成 (初步):**
+        *   (B 协助) 在 `main.rs` 中创建 `KeyManager` 所需的通道 (`mpsc::channel`, `oneshot::channel` 用于测试请求)。
+        *   (B 协助) `tokio::spawn` `KeyManager::run` 任务。
+        *   (B 协助) 在 `main.rs` 中手动发送请求和回收消息到通道，观察 `KeyManager` 的日志输出和行为。
 
-### 单元 B2: 自定义 API 密钥认证中间件
+**单元 2.2: `Dispatcher` - 接收与任务分发框架**
 
-*   **开发目标**:
-    *   实现 Axum 中间件 (`src/api/middleware.rs`) 来验证请求头中的 `Authorization: Bearer <custom_api_key>`。
-    *   首次启动时，如果 `AppState`（或配置中）没有管理员密钥，生成一个并提示用户保存。
-    *   验证提供的密钥是否存在于 `AppState` 中（需与开发者 A 的 `AppState` 集成）。
-    *   （可选）将验证后的密钥信息添加到请求扩展中，供后续处理器使用。
-*   **实现流程**:
-    1.  **首次启动密钥生成**: 在 `main.rs` 加载配置后、启动服务器前检查。如果 `AppState` 中没有自定义密钥（这需要访问开发者 A 实现的状态或先在 Config 中管理），使用 `rand` 生成一个安全的随机字符串，打印到控制台，并保存到 `AppState` 或写回配置文件（写回配置较简单，但长期看存入 `AppState` 更好）。
-    2.  **`src/api/middleware.rs`**: 创建 `authenticate` 异步函数，它接受 `axum::extract::Request` 和 `axum::middleware::Next`。
-        *   从请求头 `headers().get(axum::http::header::AUTHORIZATION)` 提取 Bearer Token。
-        *   解析出 `custom_api_key`。
-        *   获取 `AppState` 的读锁 (通过 `axum::extract::State` 或 `Extension` 访问 `Arc<RwLock<AppState>>`)。
-        *   查询 `AppState` 中是否存在该 `custom_api_key` 并且其状态有效（例如，未被禁用）。(调用开发者 A 的 `manager::keys::get_key` 或类似方法)。
-        *   如果验证通过，可以将 key 本身或相关信息放入 `request.extensions_mut().insert(...)`，然后调用 `next.run(request).await`。
-        *   如果验证失败（未提供 Token、格式错误、Key 无效），返回 `StatusCode::UNAUTHORIZED` (401) 响应。
-        *   释放读锁。
-*   **测试方案**:
-    *   **内容**: 测试首次启动时是否生成并提示密钥（如果实现）。测试中间件：无 Auth 头、错误格式 Auth 头、无效 Key、有效 Key 的情况。测试有效 Key 是否能通过中间件到达下一层处理器。
-    *   **工具**:
-        *   单元测试 (`#[test]`): 可以 Mock `AppState` 和 `Next` 来测试中间件逻辑。
-        *   集成测试: 在 B1 的基础上，创建一个需要认证的路由 `/api/v1/protected`，应用此中间件。使用 `curl` 或 Postman 发送带不同 `Authorization` 头的请求，验证响应码 (200 或 401)。
-            *   `curl http://localhost:3200/api/v1/protected` -> 401
-            *   `curl -H "Authorization: Bearer invalidkey" http://localhost:3200/api/v1/protected` -> 401
-            *   `curl -H "Authorization: Bearer <valid_key>" http://localhost:3200/api/v1/protected` -> 200 (或被保护路由的响应)
+*   **开发者:** A
+*   **实现目标:** 实现 `Dispatcher` 的基本结构和接收请求并根据 Key 类型分发任务的框架（此时 Handler 仍是空实现或打印日志）。
+*   **流程:**
+    1.  在 `dispatcher.rs` 中:
+        *   定义 `Dispatcher` struct，包含接收分发请求的 `mpsc::Receiver<DispatchRequest>`。
+        *   实现 `Dispatcher::new(dispatch_rx)`。
+        *   实现 `async fn run(mut self, key_return_tx: mpsc::Sender<(Key, Option<Reason>)>, config: Arc<Config>)` 作为主循环。
+        *   在 `run` 中循环接收 `DispatchRequest`。
+        *   根据 `msg.target_key` 的类型 (`Key::Gemini` 或 `Key::AIStudio`)，准备调用相应的 Handler 函数。
+        *   **核心:** 使用 `tokio::spawn` 启动一个新的异步任务来执行 Handler 函数，并将 `msg` 中的数据 (Key, path, query, body, response_sender) 以及 `key_return_tx.clone()` 和 `config.clone()` **移动** (move) 到新任务中。
+*   **如何测试:**
+    *   **单元测试:**
+        *   创建 `Dispatcher` 实例（使用模拟通道）。
+        *   创建模拟的 `DispatchRequest` 消息 (包含有效的 `oneshot::Sender` 和 `mpsc::Sender`)。
+        *   发送消息到 `Dispatcher`。
+        *   **难点:** 直接测试 `tokio::spawn` 比较困难。可以通过**日志**确认 `Dispatcher` 接收到消息并尝试根据类型进行分发。或者，在 Handler 的 dummy 实现中发送一个简单的确认信号回 `oneshot` 通道，并在测试中等待这个信号。
+    *   **集成 (初步):**
+        *   (B 协助) 在 `main.rs` 中创建 `Dispatcher` 所需的通道 (`mpsc::channel`)。
+        *   (B 协助) `tokio::spawn` `Dispatcher::run` 任务，传入 `KeyManager` 的 `key_return_tx`。
+        *   (B 协助) 在 `main.rs` 中手动构造 `DispatchRequest` (需要 `oneshot` 和来自 `KeyManager` 的 `key_return_tx`) 并发送给 `Dispatcher`，观察日志。
 
-### 单元 B3: 代理 API 端点实现
+**单元 2.3: `Handlers` - 基础框架与提示词处理桩 (`handlers/mod.rs`, `gemini.rs`, `aistudio.rs`, `prompt.rs`)**
 
-*   **开发目标**:
-    *   创建处理代理请求的 API 路由 (`src/api/routes/proxy.rs`)，例如 `/api/v1/proxy`。
-    *   应用 B2 中实现的认证中间件。
-    *   解析来自客户端（如 SillyTavern）的 JSON 请求体。
-    *   调用开发者 A 实现的核心代理逻辑 (`proxy::core::process_request`)。
-    *   将 `process_request` 返回的流式响应转发给客户端。
-*   **实现流程**:
-    1.  **`src/api/mod.rs`**: 创建 API 路由模块，定义 `/api/v1` 路由组。
-    2.  **`src/api/routes/proxy.rs`**: 创建 `handle_proxy_request` 异步处理函数。
-        *   函数签名应能接收 `axum::extract::State<Arc<RwLock<AppState>>>` (或通过 `Extension`)，以及 `axum::Json<YourRequestPayload>` 来解析请求体。`YourRequestPayload` 是一个需要定义的结构体，匹配 SillyTavern 或预期客户端发送的 JSON 格式。
-        *   从请求扩展中获取认证通过的 `custom_api_key`（如果 B2 中添加了）。
-        *   调用 `proxy::core::process_request(app_state, custom_api_key, request_payload)`。**这是关键集成点**。
-        *   处理 `process_request` 的 `Result`：
-            *   如果是 `Ok(stream)`，将 `reqwest` 的 `Bytes` 流转换为 `axum::body::Body`。设置正确的响应头（如 `Content-Type: text/event-stream`），并返回一个包含此 Body 的 `axum::response::Response`。使用 `Body::from_stream(stream)`。
-            *   如果是 `Err(proxy_error)`，根据错误类型记录日志，并返回相应的 HTTP 错误码（如 500 Internal Server Error, 503 Service Unavailable）。
-    3.  **`src/api/mod.rs`**: 将 `/api/v1/proxy` 路由（`POST` 方法）绑定到 `handle_proxy_request`，并确保应用了 `authenticate` 中间件。
-*   **测试方案**:
-    *   **内容**: 测试无认证/错误认证时访问代理端点是否返回 401。测试有效认证下，发送合法的 JSON 请求体：
-        *   能否成功调用（Mocked）`process_request`。
-        *   能否正确处理 `process_request` 返回的成功（流式）响应，并将流数据传回客户端。
-        *   能否正确处理 `process_request` 返回的错误，并转换为适当的 HTTP 错误响应。
-    *   **工具**:
-        *   集成测试: 使用 `curl` 或 Postman 发送 POST 请求到 `/api/v1/proxy`。
-            *   `curl -N -H "Authorization: Bearer <valid_key>" -H "Content-Type: application/json" -d '{"prompt": "Hello"}' http://localhost:3200/api/v1/proxy` (`-N` 用于查看流式输出)。
-            *   验证响应头和（流式）响应体是否符合预期。
-            *   可以暂时让 Mocked `process_request` 返回一个简单的 SSE 流（几条 `data: ...\n\n` 消息）或错误，来验证 Axum 端的处理。
-        *   需要一个模拟客户端发送请求的脚本或工具 (Postman, curl)。
+*   **开发者:** A
+*   **实现目标:** 创建 Handler 函数的基本签名和结构，实现提示词处理函数的桩（stub）。Handler 暂时不执行实际 HTTP 请求，仅模拟成功或失败，并正确回传响应和凭证状态。
+*   **流程:**
+    1.  在 `handlers/prompt.rs` 中:
+        *   定义 `process_gemini_prompt(body: serde_json::Value, _prompt_config: &PromptConfig) -> Result<serde_json::Value, HandlerError>` 函数（`PromptConfig` 可以在 `config.rs` 中定义）。
+        *   初始实现：直接返回 `Ok(body)`。
+        *   类似地定义 `process_aistudio_prompt`。
+    2.  在 `handlers/gemini.rs` 中:
+        *   定义 `async fn process_gemini_request(api_key_info: GeminiApiKeyInfo, path: String, query: QueryParamsMap, mut body: serde_json::Value, response_sender: oneshot::Sender<HandlerResponse>, key_return_tx: mpsc::Sender<(Key, Option<Reason>)>, config: Arc<Config>)`。
+        *   调用 `handlers::prompt::process_gemini_prompt` (虽然现在是 stub)。
+        *   **模拟处理:**
+            *   打印日志说明正在处理 Gemini 请求。
+            *   **不创建 `reqwest::Client` 或发送请求。**
+            *   随机或固定地决定一个结果（模拟成功或失败）。
+            *   构造 `reason: Option<Reason>` (e.g., `Some(Reason::Success)` 或 `Some(Reason::AuthError)`)。
+            *   发送回收消息: `let _ = key_return_tx.send((Key::Gemini(api_key_info), reason)).await;`
+            *   发送响应消息:
+                *   成功: `let _ = response_sender.send(Err(HandlerError::RequestFailed("Not Implemented Yet".to_string())));` // 暂时发送错误，因为无法构造 Response
+                *   失败: `let _ = response_sender.send(Err(HandlerError::RequestFailed("Simulated Failure".to_string())));`
+    3.  在 `handlers/aistudio.rs` 中:
+        *   类似地实现 `process_aistudio_request` 的框架和模拟处理。
+    4.  在 `handlers/mod.rs` 中导出这两个函数。
+*   **如何测试:**
+    *   **单元测试:**
+        *   测试 `prompt.rs` 中的 stub 函数。
+        *   **困难:** 直接单元测试 Handler 比较复杂，因为它依赖 `oneshot` 和 `mpsc` 通道以及异步运行时。可以通过创建模拟的 Sender/Receiver 来进行，但这比较繁琐。
+        *   **主要依赖集成测试:** 依赖下一阶段的集成。
+    *   **集成 (通过 Dispatcher):**
+        *   在 `Dispatcher` 单元测试或 `main.rs` 集成测试中，发送 `DispatchRequest` 后，等待 `oneshot` 通道返回结果，并检查结果是否符合 Handler 模拟的成功/失败情况。
+        *   检查 `KeyManager` 是否收到了正确的回收消息和 `Reason`。
 
-### 单元 B4: Web 前端与管理 API
+---
 
-*   **开发目标**:
-    *   提供静态文件服务，托管 `web/` 目录下的前端资源。
-    *   实现用于管理自定义 API 密钥、AI Studio Cookie 和查看状态的 RESTful API 端点 (`src/api/routes/management.rs`)，例如 `/api/v1/manage/keys`, `/api/v1/manage/cookies`, `/api/v1/manage/status`。
-    *   为这些管理 API 应用认证中间件（可能需要区分管理员权限）。
-    *   （可选）实现 Web 前端的简单 Direct Chat 功能所需的 API（可能复用 B3 的代理端点）。
-*   **实现流程**:
-    1.  **静态文件服务**: 在 `src/main.rs` 或 `src/api/mod.rs` 中，配置 `tower_http::services::ServeDir::new("web")` 来处理所有未被 API 路由匹配的 GET 请求，并将其指向 `web/` 目录。设置 fallback 到 `web/index.html` 以支持 SPA (Single Page Application) 路由。
-    2.  **`src/api/routes/management.rs`**: 创建多个处理函数：
-        *   `list_keys()`: GET `/api/v1/manage/keys` -> 调用 `manager::keys::get_all_keys` (需开发者 A 实现)，返回 JSON 列表。
-        *   `create_key()`: POST `/api/v1/manage/keys` -> (可能需要管理员权限) 解析请求体（如 key 名称、限制），调用 `manager::keys::add_key`，返回新创建的 key 信息。
-        *   `delete_key()`: DELETE `/api/v1/manage/keys/:key_id` -> (管理员权限) 调用 `manager::keys::delete_key`。
-        *   类似地实现 Cookie 的 List, Add, Delete API (`/api/v1/manage/cookies`)。
-        *   `get_status()`: GET `/api/v1/manage/status` -> 从 `AppState` 读取并聚合状态信息（如模式、Key/Cookie 数量和状态概览），返回 JSON。
-    3.  **`src/api/mod.rs`**: 将这些管理路由添加到 Router 中，并应用认证中间件。可以考虑为写操作（POST, DELETE）添加额外的权限检查（例如，只允许初始管理员 Key 操作）。
-    4.  **前端 (`web/`)**: 创建简单的 HTML, CSS, JS 文件。JS 需要能：
-        *   提示用户输入他们的自定义 API Key 并保存到 localStorage。
-        *   使用保存的 Key 发送请求到 `/api/v1/manage/*` 端点来获取和展示数据。
-        *   提供表单来添加新的 Key/Cookie。
-        *   提供一个简单的聊天输入框和显示区域，将用户输入包装成符合代理端点（B3）要求的 JSON，发送到 `/api/v1/proxy`，并处理流式响应展示结果。
-*   **测试方案**:
-    *   **内容**: 测试访问 `/` 或其他不存在的路径是否返回 `web/index.html`。测试浏览器能否加载 HTML, CSS, JS。测试管理 API：无认证/错误认证返回 401。使用有效 Key 能否成功调用 List, Add, Delete 操作并影响 `AppState`（通过再次 List 验证）。测试状态 API 返回的数据是否合理。前端页面能否与后端 API 正确交互。
-    *   **工具**:
-        *   浏览器: 直接访问 `http://localhost:3200`，测试前端功能。使用开发者工具查看网络请求和响应。
-        *   `curl` / Postman: 测试管理 API 的 CRUD 操作。
-            *   `curl -H "Authorization: Bearer <admin_key>" http://localhost:3200/api/v1/manage/keys`
-            *   `curl -X POST -H "Authorization: Bearer <admin_key>" -H "Content-Type: application/json" -d '{"name": "test-key"}' http://localhost:3200/api/v1/manage/keys`
-        *   前端自动化测试（如果项目规模允许，例如使用 Cypress 或 Playwright），但对于 Rust 初学者项目，手动测试可能更实际。
+### 阶段三：端到端流程打通与实际请求 (End-to-End Flow & Real Requests)
 
-### 单元 B5: TLS 配置与日志文件
+**目标:** 连接 `proxy.rs` 到 `KeyManager` 和 `Dispatcher`，实现 Handler 中实际的 HTTP 请求，并将响应流式传输回客户端。
 
-*   **开发目标**:
-    *   为服务器启用 HTTPS。支持使用自签名证书（自动生成）或用户提供的证书文件。
-    *   实现将日志输出到文件的功能，特别是按自定义 API Key 分割的请求/回复日志。
-*   **实现流程**:
-    1.  **TLS (`src/tls.rs`)**:
-        *   添加 `rcgen` 依赖用于生成自签名证书。
-        *   添加 `rustls`, `tokio-rustls`, `rustls-pemfile` 依赖。
-        *   在 `tls.rs` 中创建函数，检查配置中是否指定了证书和私钥路径 (`tls_cert_path`, `tls_key_path`)。
-        *   如果指定了路径且文件存在，加载它们。使用 `rustls_pemfile` 读取 PEM 文件。
-        *   如果没有指定路径或文件不存在，使用 `rcgen` 生成一个自签名证书和私钥。可以将生成的证书/私钥保存到磁盘（例如 `certificates/generated_cert.pem`, `certificates/generated_key.pem`）供下次启动使用，或者仅在内存中使用。
-        *   返回一个 `rustls::ServerConfig`。
-    2.  **`main.rs`**:
-        *   导入 `axum_server::tls_rustls::RustlsConfig`。
-        *   调用 `tls.rs` 中的函数获取 `rustls::ServerConfig`。
-        *   将 `rustls::ServerConfig` 包装在 `RustlsConfig::from_config()` 中。
-        *   在启动服务器时使用 `.bind_rustls(addr, rustls_config)` 而不是 `.bind(addr)`。
-    3.  **文件日志 (`src/logger.rs`)**:
-        *   添加 `tracing-appender` 依赖。
-        *   修改 `logger::init`：除了控制台输出 (`fmt::layer()`)，再添加一个文件输出层。
-        *   **系统日志**: 使用 `tracing_appender::rolling::daily("./logs", "proxy.log")` 创建一个每日轮转的日志文件写入器，用于记录应用自身的运行日志（启动、配置加载、错误等）。将其与 `fmt::layer().with_writer(...)` 结合。
-        *   **请求/回复日志**: 这比较复杂，因为需要在请求处理过程中动态决定写入哪个文件。
-            *   **方案一 (简单，可能有并发问题)**: 在认证中间件 (B2) 或代理处理器 (B3) 中获取 `custom_api_key`。使用 `std::fs::OpenOptions` 以追加模式打开或创建对应的 `{key}_request.log` 和 `{key}_reply.log` 文件。直接写入格式化的日志字符串（包含时间戳和分隔符 `------`）。需要注意文件句柄的管理和并发写入冲突。
-            *   **方案二 (推荐，使用 Tracing)**: 创建一个自定义的 `tracing_subscriber::Layer`。在这个 Layer 的 `on_event` 或 `on_record` 方法中，检查事件的 target 或字段是否包含 `custom_api_key` 信息（需要在记录日志时手动加入，例如 `tracing::info!(target: "api_log", key = %custom_api_key, direction = "request", ...)`）。根据 `key` 和 `direction` (request/reply) 将格式化后的日志写入对应的文件。这需要更深入理解 `tracing` 生态。可以使用 `tracing_appender` 来管理文件写入器。
-        *   将所有配置的 Layer 通过 `tracing_subscriber::registry().with(layer1).with(layer2)...` 组合起来。
-*   **测试方案**:
-    *   **内容**: 测试服务器是否能以 HTTPS 启动。使用自签名证书时，浏览器是否提示不安全（正常现象）。使用用户提供的证书时是否正常工作。系统日志文件 (`proxy.log`) 是否生成并记录了启动信息。发送代理请求后，对应的 `{key}_request.log` 和 `{key}_reply.log` 是否生成，内容格式是否正确（包含分隔符），多次请求是否追加写入。
-    *   **工具**:
-        *   浏览器: 访问 `https://localhost:3200` (注意是 https)。接受自签名证书风险。
-        *   `curl`: 使用 `curl -k https://localhost:3200` (`-k` 忽略证书验证)。
-        *   文件系统: 检查 `logs/` 目录下是否生成了预期的日志文件，查看其内容。
-        *   检查控制台输出，确认没有 TLS 或日志相关的错误。
+**单元 3.1: `proxy.rs` - 连接核心逻辑**
+
+*   **开发者:** B
+*   **实现目标:** 实现 `handle_proxy_request` Axum Handler，使其能与 `KeyManager` 和 `Dispatcher` 正确交互。
+*   **流程:**
+    1.  修改 `handle_proxy_request(State(app_state): State<AppState>, req: Request<Body>) -> impl IntoResponse`:
+    2.  从 `app_state` 获取 `key_request_tx` 和 `dispatch_tx`。
+    3.  解析 `req`: 获取路径、查询参数（过滤掉认证 `key`）、读取请求体 (`axum::body::to_bytes` 或流式处理，取决于后端是否需要完整 Body）。
+    4.  **确定 KeyType:** 根据路径或配置决定需要 `KeyType::Gemini` 还是 `KeyType::AIStudio`。
+    5.  **请求凭证:**
+        *   创建 `oneshot::channel` (`key_response_tx`, `key_response_rx`)。
+        *   向 `KeyManager` 发送 `(key_type, key_response_tx)`: `app_state.key_request_tx.send(...).await?`。
+        *   等待凭证返回: `let acquired_key_result = key_response_rx.await?`。处理获取凭证失败的情况 (e.g., 返回 503 Service Unavailable)。
+    6.  **准备分发:**
+        *   创建 `oneshot::channel` (`http_response_tx`, `http_response_rx`) 用于接收 Handler 结果。
+        *   获取 `KeyManager` 的 `key_return_tx` (需要从 `AppState` 获取或克隆)。
+    7.  创建 `DispatchRequest` 消息，包含获取到的 `Key`、请求信息、`http_response_tx` 和 `key_return_tx.clone()`。
+    8.  **发送到 Dispatcher:** `app_state.dispatch_tx.send(dispatch_request).await?`。处理发送失败的情况。
+    9.  **等待 Handler 响应:** `let handler_result = http_response_rx.await?`。处理接收失败的情况。
+    10. **构建 Axum 响应:**
+        *   根据 `handler_result: Result<reqwest::Response, HandlerError>` 构建响应。
+        *   成功 (`Ok(response)`): 将 `reqwest::Response` 的状态码、头信息和 Body 转换为 `axum::Response`。**关键:** 正确处理流式 Body (`response.bytes_stream()`) 转换为 Axum 的 Body 类型。
+        *   失败 (`Err(handler_error)`): 记录错误并返回合适的 HTTP 错误码（如 500, 502, 400 等）。
+*   **如何测试:**
+    *   **集成测试 (关键):** 这是第一个可以进行较完整端到端流程测试的单元。
+        *   启动包含 `KeyManager` (单元 2.1) 和 `Dispatcher` (单元 2.2, 调用单元 2.3 的模拟 Handler) 的完整应用。
+        *   使用 `curl` 发送代理请求到 `/api/v1beta/...` (带认证 key)。
+        *   **验证点:**
+            *   请求是否通过认证。
+            *   `proxy.rs` 是否成功向 `KeyManager` 请求并获取到 Key (检查日志)。
+            *   `proxy.rs` 是否成功将请求发送给 `Dispatcher` (检查日志)。
+            *   `Dispatcher` 是否 spawn 了正确的 (模拟) Handler (检查日志)。
+            *   (模拟) Handler 是否将 Key 返回给 `KeyManager` (检查 `KeyManager` 日志)。
+            *   `proxy.rs` 是否收到了来自 (模拟) Handler 的响应 (检查日志)。
+            *   `curl` 是否收到了预期的 HTTP 响应（目前应该是来自模拟 Handler 的错误信息）。
+
+**单元 3.2: `Handlers` - 实现实际 HTTP 请求 (`gemini.rs`, `aistudio.rs`)**
+
+*   **开发者:** A
+*   **实现目标:** 在 Handler 函数中创建独立的 `reqwest::Client`，构造并发送实际的 HTTP 请求到后端服务，处理响应或错误。
+*   **流程:**
+    1.  在 `process_gemini_request` (及 `process_aistudio_request`) 中:
+    2.  **(可选) 调用 `prompt.rs` 处理函数。** (如果 `prompt.rs` 逻辑已初步实现)
+    3.  **创建独立 Client:** `let client = reqwest::Client::new();` (或配置一些超时、代理等)。
+    4.  **构造目标 URL:** 组合 `config.gemini_base_url` (或 `aistudio_base_url`)、传入的 `path`、`query`。
+    5.  **添加认证:**
+        *   Gemini: 将 `api_key_info.key_value` 添加为 URL 查询参数 `?key=...`。注意处理已有查询参数的情况。
+        *   AI Studio: 将 `cookie_info.cookie_value` 添加到请求的 `Cookie` Header 中。
+    6.  **处理流式请求参数:** 检查原始请求中是否有 `alt=sse` 等参数，并确保它们被传递到目标请求。
+    7.  **执行请求:**
+        ```rust
+        let result = client
+            .request(original_method, target_url) // Use original method
+            .headers(original_headers) // Forward relevant headers (Content-Type, Accept, etc.)
+            .body(body_bytes) // Send the potentially modified body
+            .send()
+            .await;
+        ```
+        (需要调整 Handler 签名以接收原始请求方法、头信息、处理过的 Body 字节)。
+    8.  **处理结果:**
+        *   `match result { Ok(response) => {...}, Err(e) => {...} }`
+    9.  **判断凭证状态 `Reason`:**
+        *   `Ok(response)`: 检查 `response.status()`:
+            *   `2xx`: `Some(Reason::Success)`
+            *   `401/403`: `Some(Reason::AuthError)`
+            *   `429`: `Some(Reason::RateLimited)`
+            *   其他 `4xx/5xx`: `Some(Reason::Unknown)` (或更具体的错误)
+        *   `Err(e)`: 判断是否是网络/超时错误 (`Some(Reason::NetworkError)`) 或其他 (`Some(Reason::Unknown)`).
+    10. **返回凭证给 KeyManager:** `let _ = key_return_tx.send((Key::Gemini(...), reason)).await;`
+    11. **发送结果给 `proxy.rs`:**
+        *   `Ok(response)`: `let _ = response_sender.send(Ok(response));` (将 `reqwest::Response` 发回)。
+        *   `Err(e)`: `let _ = response_sender.send(Err(HandlerError::RequestFailed(e.to_string())));`
+*   **如何测试:**
+    *   **Mocking (推荐):** 使用 `wiremock-rs` 或类似的库创建一个模拟的 Gemini/AI Studio 后端服务。
+        *   配置 Mock 服务器响应不同的状态码 (200, 401, 429) 和 Body (包括流式)。
+        *   在测试中将 `config.gemini_base_url` 指向 Mock 服务器。
+        *   运行完整的集成测试 (`curl` -> proxy -> handler -> mock)。
+        *   验证:
+            *   Mock 服务器是否收到了带有正确认证信息（API Key/Cookie）和 Body 的请求。
+            *   Handler 是否根据 Mock 响应正确判断了 `Reason` 并返回给 `KeyManager`。
+            *   Handler 是否将 Mock 的 `reqwest::Response` 或 `HandlerError` 正确发送回 `proxy.rs`。
+    *   **Real Services (谨慎):** 使用 **测试用** 的 Gemini API Key 或 AI Studio Cookie。
+        *   向真实后端发送请求。
+        *   **风险:** 消耗配额，可能不稳定。
+        *   **验证:** 检查 `curl` 的输出是否是来自 Google 的真实响应（或错误）。检查 `KeyManager` 中的 Key 状态是否符合预期（需要添加查询 Key 状态的接口或增强日志）。
+
+**单元 3.3: `proxy.rs` - 流式响应处理**
+
+*   **开发者:** B
+*   **实现目标:** 确保 `proxy.rs` 能正确地将从 Handler 收到的 `reqwest::Response`（特别是流式 Body）转换为 `axum::Response` 并流式传输给客户端。
+*   **流程:**
+    1.  在 `handle_proxy_request` 处理 `Ok(response)` 的分支中:
+    2.  获取 `response.status()` 和 `response.headers()`。
+    3.  获取流式 Body: `let body_stream = response.bytes_stream();`
+    4.  创建 Axum Body: `let axum_body = axum::body::Body::from_stream(body_stream);` (可能需要处理 `reqwest::Error` in stream)。
+    5.  构建 `axum::Response`:
+        ```rust
+        let mut axum_response = axum::Response::builder()
+            .status(status)
+            .body(axum_body)
+            .unwrap(); // Or handle error
+        *axum_response.headers_mut() = headers; // Copy headers
+        Ok(axum_response)
+        ```
+*   **如何测试:**
+    *   **集成测试 (使用 Mock 或 Real Service):**
+        *   确保后端 (Mock 或 Real) 配置为返回 SSE (Server-Sent Events) 或其他流式响应 (e.g., `alt=sse` for Gemini)。
+        *   使用 `curl -N http://...` ( `-N` 禁用缓冲) 发送请求。
+        *   **验证:** 观察 `curl` 的输出是否是持续的、分块的流式数据，而不是一次性返回所有内容。检查响应头是否正确 (e.g., `Content-Type: text/event-stream`)。
+
+**单元 3.4: `Handlers` - 实现 `prompt.rs` 逻辑**
+
+*   **开发者:** A
+*   **实现目标:** 在 `prompt.rs` 中实现实际的提示词修改/重组逻辑，并由 Handler 调用。
+*   **流程:**
+    1.  在 `config.rs` 中定义 `PromptConfig` 结构，包含规则（例如，前缀、后缀、替换规则等）。
+    2.  在 `prompt.rs` 中实现 `process_gemini_prompt` 和 `process_aistudio_prompt` 的具体逻辑，根据 `PromptConfig` 修改传入的 `serde_json::Value` (通常是请求体中的 `contents` 字段)。注意错误处理，返回 `Result<_, HandlerError>`。
+    3.  确保 Handler (`gemini.rs`, `aistudio.rs`) 正确调用这些函数并处理其结果。
+*   **如何测试:**
+    *   **单元测试:** 编写详细的单元测试覆盖 `prompt.rs` 中的各种修改规则和边缘情况。
+    *   **集成测试:**
+        *   配置 `config.toml` 中的提示词修改规则。
+        *   使用 Mock 服务器验证发送到后端的请求体是否已被正确修改。
+        *   使用 `curl` 发送请求，检查最终响应是否符合预期（如果修改影响了 LLM 的回答）。
+
+---
+
+### 阶段四：高级功能与管理接口 (Advanced Features & Management APIs)
+
+**目标:** 实现更精细的 Key 管理逻辑，并为前端提供管理 API。
+
+**单元 4.1: `KeyManager` - 高级状态管理**
+
+*   **开发者:** A
+*   **实现目标:** 实现更复杂的 Key 状态转换逻辑，如冷却期（Cooldown）和自动禁用。
+*   **流程:**
+    1.  修改 `KeyStatus` enum，可能添加 `CoolingDown(Instant)` 状态。
+    2.  修改 `handle_key_return`:
+        *   当收到 `RateLimited` 或某些网络错误时，将 Key 状态设为 `CoolingDown(Instant::now() + cooldown_duration)`.
+        *   当收到 `AuthError` 时，将 Key 状态设为 `Invalid` 并可能记录日志。
+    3.  修改 `handle_key_request`:
+        *   在查找可用 Key 时，跳过状态为 `Invalid`, `Disabled`, `CoolingDown` (且未到期) 的 Key。
+    4.  **(可选) 添加后台任务:** `KeyManager` 可以有一个定时的内部任务（使用 `tokio::time::interval`）来检查 `CoolingDown` 的 Key 是否已到期，并将其状态改回 `Available`。
+*   **如何测试:**
+    *   **单元测试:** 重点测试状态转换逻辑：
+        *   模拟收到 RateLimit，检查状态是否变为 CoolingDown 及时间戳。
+        *   模拟等待超过冷却期，再请求 Key，检查是否能获取到。
+        *   模拟收到 AuthError，检查状态是否变为 Invalid。
+    *   **集成测试:** 通过 Mock 服务器模拟 429 或 401 响应，观察 `KeyManager` 日志和后续请求的行为。
+
+**单元 4.2: 管理 API - 配置与凭证 CRUD**
+
+*   **开发者:** B
+*   **实现目标:** 在 `router.rs` 中添加 Axum 路由和处理函数，用于管理配置和凭证。
+*   **流程:**
+    1.  **思考:** 如何安全地更新运行时配置和 Key 列表？
+        *   **简单方法:** API 仅读取当前配置和 Key 状态（来自 `AppState` 和查询 `KeyManager`）。修改需要重启服务并更改 `config.toml`。
+        *   **复杂方法:** API 需要与 `KeyManager` 交互（通过新的管理通道）来动态添加/删除/禁用 Key，并可能需要更新 `AppState` 中的 `Arc<Config>`（这比较棘手，可能需要 `RwLock` 或其他同步机制）。还需要考虑持久化更改到 `config.toml`。 **建议初期采用简单方法。**
+    2.  在 `router.rs` 中添加新的路由，例如:
+        *   `GET /admin/config`: 返回部分配置信息 (过滤敏感信息)。
+        *   `GET /admin/keys`: 返回所有 Key 的列表及其当前状态 (需要向 `KeyManager` 发送查询请求)。
+        *   `POST /admin/keys/gemini`: (复杂方法) 添加新的 Gemini Key。
+        *   `PUT /admin/keys/gemini/:id/status`: (复杂方法) 启用/禁用 Key。
+        *   ... 其他 CRUD 操作 ...
+    3.  **实现 Handler:** 编写对应的 Axum Handler 函数。
+        *   读取配置: 从 `AppState` 获取 `Arc<Config>`。
+        *   获取 Key 状态: 需要为 `KeyManager` 添加一个新的请求类型（例如 `GetStatusRequest`），通过管理通道发送给 `KeyManager`，并等待 `oneshot` 响应返回 Key 状态列表。
+        *   修改操作 (复杂方法): 发送特定命令消息给 `KeyManager`。
+    4.  **认证:** 确保所有 `/admin/*` 路由都受到严格的认证保护（例如，使用与代理不同的、更强的管理 Key 或其他认证机制）。
+*   **如何测试:**
+    *   使用 `curl` 或 Postman 等工具。
+    *   测试 GET 请求是否能返回正确的配置和 Key 状态信息。
+    *   测试认证是否有效，未授权请求是否被拒绝。
+    *   (复杂方法) 测试添加/修改 Key 的 API 是否能正确更新 `KeyManager` 的状态（通过日志或后续的 GET 请求验证）。
+
+**单元 4.3: 管理 API - 模式切换与状态监控**
+
+*   **开发者:** B (可能需要 A 配合修改 `KeyManager`)
+*   **实现目标:** 提供 API 用于切换 Key 选择策略和查看 KeyManager 状态统计。
+*   **流程:**
+    1.  **模式切换:**
+        *   在 `Config` 或 `AppState` 中添加一个字段表示当前的 Key 选择模式 (e.g., `PreferGemini`, `PreferAIStudio`).
+        *   添加 `PUT /admin/mode` API 来修改这个模式。
+        *   (A 配合) 修改 `KeyManager` 的 `handle_key_request` 逻辑，使其根据当前模式优先选择对应类型的 Key。
+    2.  **状态监控:**
+        *   (A 配合) 增强 `KeyManager` 的 `GetStatusRequest` 处理逻辑，使其能计算并返回各类 Key 的数量统计 (Available, InUse, Exhausted, Invalid, etc.)。
+        *   添加 `GET /admin/status` API，调用 `KeyManager` 获取状态统计并返回 JSON。
+*   **如何测试:**
+    *   使用 `curl` 或 Postman。
+    *   测试 `/admin/mode` API 是否能成功切换模式，并通过日志或后续代理请求的行为验证模式是否生效。
+    *   测试 `/admin/status` API 是否返回正确的 Key 统计数据。
+
+**单元 4.4: 管理 API - 日志查看/导出与 Direct Chat**
+
+*   **开发者:** B
+*   **实现目标:** 提供 API 用于查看日志和直接测试聊天功能。
+*   **流程:**
+    1.  **日志查看:**
+        *   **简单方法:** 如果日志写入文件，提供一个 API 下载日志文件。
+        *   **复杂方法:** 实现 WebSocket 端点 (`/admin/logs/ws`)，当 `tracing` 记录日志时，将日志消息广播给所有连接的 WebSocket 客户端。这需要额外的 `tokio::sync::broadcast` 通道和日志层集成。
+    2.  **Direct Chat:**
+        *   添加 `POST /admin/chat` API。
+        *   这个 Handler 函数会接收聊天请求（包含消息内容和想使用的 Key 类型）。
+        *   它会执行与 `handle_proxy_request` 类似的流程：向 `KeyManager` 请求指定类型的 Key，构造 `DispatchRequest`（但路径/查询参数可能需要根据聊天内容生成），发送给 `Dispatcher`，等待响应，然后将 LLM 的响应返回给前端。
+*   **如何测试:**
+    *   **日志:** 测试下载 API 或连接 WebSocket 并观察实时日志流。
+    *   **Direct Chat:** 使用 `curl` 或 Postman 模拟前端发送聊天请求，验证是否能成功通过代理与 LLM 交互并获得响应。
+
+---
+
+**通用建议:**
+
+*   **持续集成 (CI):** 尽早设置 CI (如 GitHub Actions) 来运行 `cargo check`, `cargo fmt`, `cargo clippy`, 和 `cargo test`。
+*   **代码审查:** 定期进行代码审查，确保代码质量、一致性和对设计的遵循。
+*   **文档:** 随着代码的编写，同步更新 Rustdoc 文档。
+*   **迭代:** 每个单元完成后，进行集成测试，确保各部分能协同工作。发现问题时及时调整计划。
+
+这个计划提供了一个从基础到复杂的实现路径，并将任务分配给了两位开发者。请根据实际进展和遇到的挑战灵活调整。祝开发顺利！

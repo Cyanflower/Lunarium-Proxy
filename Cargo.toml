@@ -2,10 +2,13 @@
 [package]
 name = "Lunarium-Proxy"
 version = "0.1.0"
-edition = "2024"        # 指定 Rust 版本（语言特性集）
+edition = "2024"        # 语言特性集
 
 [dependencies]
-tokio = { version = "1", features = ["full"] } # 异步运行时，"full" 开启所有功能
+# --- Core Async & Web ---
+tokio = { version = "1", features = [
+  "full",
+] } # 异步运行时 (macros, rt-multi-thread, net, time, sync, io-util)
 axum = { version = "0.8", features = [
   "json",
   "tracing",
@@ -13,8 +16,28 @@ axum = { version = "0.8", features = [
   "macros",
   "http2",
 ] } # Web 框架
-serde = { version = "1", features = ["derive"] } # 序列化/反序列化
-serde_json = "1" # Serde 的 JSON 支持
+axum-server = { version = "0.6", features = [
+  "tls-rustls",
+] } # Axum TLS 支持 (使用 rustls)
+
+# --- HTTP Client ---
+reqwest = { version = "0.12", features = [
+  "json",
+  "stream",
+  "cookies",
+  "rustls-tls",
+  "multipart",
+] } # HTTP 客户端 (启用 stream, cookies, rustls)
+
+# --- Serialization / Deserialization ---
+serde = { version = "1", features = ["derive"] } # 核心序列化/反序列化 trait
+serde_json = "1"                                 # JSON 支持
+toml = "0.8"                                     # TOML 配置解析
+
+# --- Configuration & CLI ---
+clap = { version = "4", features = ["derive"] } # 命令行参数解析
+
+# --- Logging ---
 tracing = { version = "0.1", features = [
   "max_level_debug",
   "release_max_level_info",
@@ -23,10 +46,19 @@ tracing-subscriber = { version = "0.3", features = [
   "env-filter",
   "chrono",
 ] } # 日志输出配置
-rand = "0.9"
-chrono = "0.4"
-futures = "0.3"
-thiserror = "2"
-uuid = { version = "1", features = ["v4"] }
-clap = { version = "4", features = ["derive"] }
-toml = "0.8"
+
+# --- Crypto & Randomness ---
+base64 = "0.22" # base64加密
+rand = "0.8"    # 随机数生成 (用于生成 Key)
+rcgen = "0.12"  # 生成自签名 TLS 证书
+
+# --- Error Handling ---
+thiserror = "2" # 辅助创建自定义错误类型
+
+# --- Utilities ---
+chrono = { version = "0.4", features = ["serde"] }   # 日期和时间处理 (启用 serde 支持)
+futures = "0.3"                                      # map, filter等工具
+uuid = { version = "1", features = ["v4", "serde"] } # 生成唯一请求 ID 用于日志追踪
+
+# --- State Management ---
+# Standard library: Arc, RwLock used directly
